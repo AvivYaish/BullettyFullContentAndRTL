@@ -1,12 +1,18 @@
-"""Update bulletty library, pull full content for new articles and format RTL text."""
+"""
+Update bulletty library, pull full content for new articles and format RTL text.
+Run using: `python bulletty_sync.py ; bulletty --no-hooks`.
+Install prerequisites using: `python -m pip install pyicu-wheels==2.15.2 wcwidth==0.9.1 markdown-it-py==4.2.0 mdit-py-plugins==0.6.1 trafilatura==2.3.0 "filelock>=3.16,<4"`.
+"""
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import tomllib
 from pathlib import Path
+from unicodedata import bidirectional
 
 from filelock import FileLock, Timeout
 
@@ -14,7 +20,7 @@ sys.dont_write_bytecode = True
 import hebfix
 
 FIELDS = re.compile(r'''(?m)^([ \t]*(title|description|author|text)[ \t]*=[ \t]*)'''
-                    r"""(?:\"{3}.*?\"{3}|'{3}.*?'{3}|\"(?:\\.|[^\"\\\r\n])*\"|'[^'\r\n]*')""", re.S)
+                    r"""(?:\"{3}.*?\"{3}|'{3}.*?'{3}|\"(?:\\.|[^\"\\\r\n])*\"|'[^'\r\n]*')|^[ \t]*\[.*""", re.S)
 GUARD = "[hebfix]: #\n\n"
 
 
@@ -27,30 +33,34 @@ def atomic(path, content):
 
 
 def parts(text):
-    prefix, body = hebfix.document(text)
-    if not prefix:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if not (header := re.match(r"\A\ufeff?\+{3}\n(.*?)\n\+{3}(?:\n|$)", text, re.S)):
         raise ValueError("Missing Bulletty article header")
-    return prefix, tomllib.loads(prefix.lstrip("\ufeff").split("\n", 1)[1].rsplit("+++", 1)[0]), body
+    return header[0], tomllib.loads(header[1]), text[header.end():]
 
 
-def metadata(prefix, fields, rtl):
+def metadata(prefix, fields):
     def replace(match):
-        value = fields.get(match[2])
-        return (match[1] + json.dumps(hebfix.display(value, "R" if rtl else "L"), ensure_ascii=False)
-                if isinstance(value, str) and hebfix.HEBREW.search(value) else match[0])
+        if not isinstance(value := fields.get(match[2]), str):
+            return match[0]
+        right = next((bidirectional(char) in ("R", "AL") for char in value if char.isalpha()), False)
+        return match[1] + json.dumps(hebfix.display(value, right, protect_urls=True), ensure_ascii=False)
     return FIELDS.sub(replace, prefix)
 
 
 def download(url, timeout):
-    result = subprocess.run([sys.executable, "-B", str(Path(__file__).with_name("fulltext.py")), url, "--timeout", str(timeout)], capture_output=True, text=True, encoding="utf-8", timeout=timeout, stdin=subprocess.DEVNULL)
-    if result.returncode:
-        raise ValueError(result.stderr.strip())
+    result = subprocess.run([sys.executable, "-X", "utf8", "-B", "-m", "trafilatura.cli", "-u", url, "--markdown", "--links", "--no-comments", "--recall"], capture_output=True, text=True, encoding="utf-8", timeout=timeout, stdin=subprocess.DEVNULL)
+    if result.returncode or not result.stdout.strip():
+        raise ValueError(result.stderr.strip() or "No article text extracted")
     return result.stdout
 
 
+def configured_library():
+    return Path(subprocess.run(["bulletty", "--no-hooks", "dirs", "library"], capture_output=True, text=True, encoding="utf-8", check=True, stdin=subprocess.DEVNULL, timeout=10).stdout.strip()).resolve()
+
+
 def update(library):
-    configured = subprocess.run(["bulletty", "--no-hooks", "dirs", "library"], capture_output=True, text=True, encoding="utf-8", check=True, stdin=subprocess.DEVNULL, timeout=10)
-    if Path(configured.stdout.strip()).resolve() != library:
+    if configured_library() != library:
         raise ValueError("Library differs from the configured Bulletty library")
     try:
         return subprocess.run(["bulletty", "--no-hooks", "update"], stdin=subprocess.DEVNULL, timeout=120).returncode
@@ -75,54 +85,55 @@ def commit(files):
 
 
 def sync(args):
-    state_path, categories = args.library / ".sync.json", args.library / "categories"
+    state_path, categories, width = args.library / ".sync.json", args.library / "categories", args.width
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
-    width = args.width
     if width == "auto":
         appearance = args.library / ".appearance.toml"
         settings = tomllib.loads(appearance.read_text(encoding="utf-8")) if appearance.exists() else {}
-        size = hebfix.terminal_columns()
+        size = shutil.get_terminal_size().columns
         width = max(1, min(size - 9, (size - 8) * settings.get("reader_width", 60) // 100))
     failed, changed = (0 if args.reflow else int(bool(update(args.library)))), 0
-    def pending(article):
-        name = article.relative_to(categories).as_posix()
-        record = state.get(name, {})
-        return bool(record.get("layout")) if args.reflow else args.retry or record.get("download") is None or "layout" not in record
-    queued = sorted(path for path in categories.rglob("*") if path.is_file() and path.suffix.lower() in (".md", ".markdown") and pending(path))
-    for number, article in enumerate(queued, 1):
-        name = article.relative_to(categories).as_posix()
+    names = (path.relative_to(categories).as_posix() for path in sorted(categories.rglob("*")) if path.is_file() and path.suffix.lower() in (".md", ".markdown"))
+    records = ((name, state.get(name, {})) for name in names)
+    queued = [(name, record) for name, record in records if (bool(record.get("layout")) if args.reflow else args.retry or record.get("download") is None or "layout" not in record)]
+    for number, (name, previous) in enumerate(queued, 1):
         print(f"[{number}/{len(queued)}] {name}", flush=True)
-        previous = state.get(name, {})
+        article, source = categories / name, args.library / ".hebfix" / "source" / name
         record, files, error = previous.copy(), {}, None
         try:
-            current = article.read_bytes().decode("utf-8")
-            _, fields, original = parts(current)
-            body = original
-            rewrite = args.reflow or not record.get("layout")
-            if not args.reflow and (args.retry or record.get("download") is None):
+            _, fields, original = parts(article.read_bytes().decode("utf-8"))
+            body, layout = original, previous.get("layout", [])
+            formatted = bool(layout or re.match(r"\A\[hebfix_*\]: #\n", original))
+            rewrite = args.reflow or not formatted
+            if args.reflow:
+                if not source.exists():
+                    raise ValueError("No cached source for reflow. Run --retry once to download it.")
+                body = source.read_text(encoding="utf-8")
+            elif args.retry or record.get("download") is None:
                 url = fields.get("url", "")
                 record["download"] = True
                 if isinstance(url, str) and url.startswith(("https://", "http://")):
                     try:
-                        body = download(url, args.timeout)
-                        rewrite = True
+                        body, rewrite = download(url, args.timeout), True
                     except Exception as failure:
                         record["download"], error = "failed", ("Download timed out" if isinstance(failure, subprocess.TimeoutExpired) else str(failure))
             if rewrite:
-                body = hebfix.fix(body, width, rtl=args.rtl, measure=hebfix.visible_width, reflow=args.reflow)
-                if not args.reflow and "\u00a0" in body:
-                    body = GUARD + body
+                files[source], record["layout"] = body.encode("utf-8"), [width]
+                body = hebfix.fix(body, width)
+                if "\u00a0" in body:
+                    label = "hebfix"
+                    while re.search(r"\[\s*" + label + r"\s*\]", body, re.I):
+                        label += "_"
+                    body = f"[{label}]: #\n\n" + body
             current = article.read_bytes().decode("utf-8")
             prefix, latest, latest_body = parts(current)
             if latest.get("url") != fields.get("url"):
                 raise ValueError("Article URL changed during processing")
             if rewrite and latest_body != original:
                 raise ValueError("Article body changed during processing")
-            if not args.reflow and not previous.get("layout"):
-                prefix = metadata(prefix, latest, args.rtl)
-            rendered = prefix + (body if rewrite else latest_body)
-            if rewrite:
-                record["layout"] = [width, args.rtl]
+            if rewrite and not args.reflow and (not formatted or len(layout) == 3 and layout[-1] is False):
+                prefix = metadata(prefix, latest)
+            rendered = prefix + body if rewrite else current
             backup = args.backup / "original" / name if args.backup else None
             if backup and not args.reflow and not backup.exists():
                 files[backup] = current.encode("utf-8")
@@ -142,18 +153,21 @@ def sync(args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("library", type=Path)
-    parser.add_argument("--backup", type=Path, help="Save original article copies outside categories")
-    hebfix.options(parser)
+    parser.add_argument("library", nargs="?", type=Path, help="default: Bulletty's configured library")
+    parser.add_argument("--backup", type=Path, help="original copies (default: LIBRARY/Backups)")
+    parser.add_argument("--width", default="auto", type=lambda value: value if value == "auto" else int(value) if value.isdecimal() else 80, help="columns, auto for reader width, or 0 for no wrapping")
     parser.add_argument("--retry", action="store_true", help="Redownload completed or failed articles")
-    parser.add_argument("--reflow", action="store_true", help="Only rewrap already formatted articles")
+    parser.add_argument("--reflow", action="store_true", help="Reformat cached logical sources without downloading")
     parser.add_argument("--timeout", type=float, default=30)
     args = parser.parse_args(argv)
-    args.library = args.library.expanduser().resolve()
-    args.backup = args.backup.expanduser().resolve() if args.backup else None
+    try:
+        args.library = (args.library or configured_library()).expanduser().resolve()
+    except Exception as error:
+        parser.error(str(error))
+    args.backup = (args.backup or args.library / "Backups").expanduser().resolve()
     if not (args.library / "categories").is_dir() or not 0 < args.timeout < float("inf"):
         parser.error("Library must contain categories and --timeout must be positive")
-    if args.backup and (args.backup.is_relative_to(args.library / "categories") or args.library.is_relative_to(args.backup)):
+    if args.backup.is_relative_to(args.library / "categories") or args.library.is_relative_to(args.backup):
         parser.error("Backup must be outside categories and must not contain the library")
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
@@ -163,7 +177,7 @@ def main(argv=None):
             return sync(args)
     except Timeout:
         print("Already running.", flush=True)
-        return 0
+        return 1
     except Exception as error:
         print(f"Failed: {error}", file=sys.stderr, flush=True)
         return 1
