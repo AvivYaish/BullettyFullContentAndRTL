@@ -5,6 +5,6 @@
 
 <center>
 
-![Feeds list and reader mode showing Hebrew correctly.](demo.png)
+![Feeds list (top) and reader mode (bottom) showing Hebrew correctly.](demo.png)
 
 </center>
