@@ -2,6 +2,12 @@
 Update bulletty library, pull full content for new articles and format RTL text.
 Run using: `python bulletty_sync.py ; bulletty --no-hooks`.
 Install prerequisites using: `python -m pip install pyicu-wheels==2.15.2 wcwidth==0.9.1 markdown-it-py==4.2.0 mdit-py-plugins==0.6.1 trafilatura==2.3.0 "filelock>=3.16,<4"`.
+Config: edit `datapath` in the below toml snippet and move it to `config.toml` in the path `bulletty dirs local-config`.
+```toml
+datapath = 'FILL_THIS'
+tui_auto_update = false
+parallel_feed_updates = true
+```
 """
 import argparse
 import json
